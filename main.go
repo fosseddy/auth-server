@@ -241,8 +241,7 @@ func refreshAccessToken(c echo.Context) error {
 		RefreshToken string `json:"refreshToken"`
 	})
 
-	err := c.Bind(body)
-	if err != nil {
+	if err := c.Bind(body); err != nil {
 		return err
 	}
 
