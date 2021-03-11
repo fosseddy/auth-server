@@ -217,17 +217,14 @@ func logout(c echo.Context) error {
 	tokenString := pair[1]
 
 	// Validate token
-	decoded, err := decodeAccessToken(tokenString)
-	if err != nil {
+	if _, err := decodeAccessToken(tokenString); err != nil {
 		return err
 	}
 
-	if decoded != nil {
-		tc := database.Collection("tokens")
-		_, err = tc.DeleteOne(ctx, bson.D{{Key: "accessToken", Value: decoded.Raw}})
-		if err != nil {
-			return err
-		}
+	tc := database.Collection("tokens")
+	_, err := tc.DeleteOne(ctx, bson.D{{Key: "accessToken", Value: tokenString}})
+	if err != nil {
+		return err
 	}
 
 	return c.JSON(http.StatusOK, map[string]string{
