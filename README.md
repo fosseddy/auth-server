@@ -1,1 +1,0 @@
-# Time Manager Auth Service
