@@ -47,6 +47,7 @@ func main() {
 
 	e := echo.New()
 	e.Use(middleware.Logger())
+        e.Use(middleware.CORS())
 
 	e.POST("/api/auth/register", register)
 	e.POST("/api/auth/login", login)
