@@ -8,6 +8,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/dgrijalva/jwt-go"
 	"github.com/labstack/echo/v4"
 	"github.com/labstack/echo/v4/middleware"
 	"go.mongodb.org/mongo-driver/bson"
@@ -47,13 +48,14 @@ func main() {
 
 	e := echo.New()
 	e.Use(middleware.Logger())
-        e.Use(middleware.CORS())
+	e.Use(middleware.CORS())
 
 	e.POST("/api/auth/register", register)
 	e.POST("/api/auth/login", login)
 	e.POST("/api/auth/logout", logout)
 	e.POST("/api/auth/refresh-access-token", refreshAccessToken)
 	e.POST("/api/auth/clear-expired-tokens", clearExpiredTokens)
+	e.POST("/api/auth/me", getUser)
 
 	e.Logger.Fatal(e.Start(":8080"))
 }
@@ -370,6 +372,71 @@ func clearExpiredTokens(c echo.Context) error {
 		"message": "Expired tokens were successfully deleted",
 		"data": map[string]interface{}{
 			"count": deleteRes.DeletedCount,
+		},
+	})
+}
+
+// @TODO: clean up
+func getUser(c echo.Context) error {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	// Validate header
+	header := c.Request().Header.Get("Authorization")
+	if header == "" {
+		return c.JSON(http.StatusUnauthorized, map[string]interface{}{
+			"status":  "error",
+			"message": "Not authorized",
+		})
+	}
+
+	pair := strings.Split(header, " ")
+	if len(pair) != 2 {
+		return c.JSON(http.StatusUnauthorized, map[string]interface{}{
+			"status":  "error",
+			"message": "Not authorized",
+		})
+	}
+
+	tokenString := pair[1]
+
+	// Validate token
+	decoded, err := decodeAccessToken(tokenString)
+	if err != nil {
+		return err
+	}
+
+	id, err := primitive.ObjectIDFromHex(decoded.Claims.(jwt.MapClaims)["userId"].(string))
+	if err != nil {
+		return err
+	}
+
+	user := new(userModel)
+	uc := database.Collection("users")
+	singleRes := uc.FindOne(
+		ctx,
+		bson.D{{Key: "_id", Value: id}},
+	)
+
+	if err := singleRes.Decode(user); err != nil {
+		if err == mongo.ErrNoDocuments {
+			return c.JSON(http.StatusBadRequest, map[string]string{
+				"status":  "error",
+				"message": "Wrong credentials",
+			})
+		}
+
+		return err
+	}
+
+	return c.JSON(http.StatusOK, map[string]interface{}{
+		"status":  "success",
+		"message": "User info successfully retrieved",
+		"data": map[string]interface{}{
+			"user": map[string]interface{}{
+				"id":       user.ID.Hex(),
+				"username": user.Username,
+			},
 		},
 	})
 }
