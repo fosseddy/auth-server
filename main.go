@@ -406,6 +406,13 @@ func getUser(c echo.Context) error {
 		return err
 	}
 
+	if decoded == nil {
+		return c.JSON(http.StatusUnauthorized, map[string]string{
+			"status":  "error",
+			"message": "Access token has expired",
+		})
+	}
+
 	id, err := primitive.ObjectIDFromHex(decoded.Claims.(jwt.MapClaims)["userId"].(string))
 	if err != nil {
 		return err
