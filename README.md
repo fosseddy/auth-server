@@ -1,1 +1,1 @@
-# Time Manager Auth Service
+# Auth Server
