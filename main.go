@@ -9,11 +9,16 @@ import (
 	"time"
 	"log"
 	"strings"
-	_"encoding/json"
+	"encoding/json"
+	"regexp"
 )
+
+// at least 3 chars long, starts with alpha then [a-zA-Z0-9_]
+var	usernameRegexp = regexp.MustCompile(`^[a-zA-Z]{1}\w{2,}$`)
 
 type handler struct {
 	db *sql.DB
+	body map[string]any
 }
 
 func loadenv() {
@@ -69,15 +74,65 @@ func allowMethods(w http.ResponseWriter, r *http.Request,
 }
 
 func register(h handler, w http.ResponseWriter, r *http.Request) {
+	body := struct {
+		Username string `json:"username"`
+		Password string `json:"password"`
+	}{}
+	err := json.NewDecoder(r.Body).Decode(&body)
+	if err != nil {
+		w.WriteHeader(http.StatusBadRequest)
+		err, ok := err.(*json.UnmarshalTypeError)
+		if ok {
+			w.Write([]byte(fmt.Sprintf(
+				`{"message":"%s must be %s"}`, err.Field, err.Type.String(),
+			)))
+		} else {
+			w.Write([]byte(`{"message":"invalid json"}`))
+		}
+		return
+	}
+
+	body.Username = strings.Trim(body.Username, " ")
+	body.Password = strings.Trim(body.Password, " ")
+
+	if !usernameRegexp.MatchString(body.Username) {
+		w.WriteHeader(http.StatusBadRequest)
+		w.Write([]byte(
+			`{"message":"username must start with a letter and ` +
+			`be at least 3 characters long"}`,
+		))
+		return
+	}
+	if len(body.Password) < 3 {
+		w.WriteHeader(http.StatusBadRequest)
+		w.Write([]byte(
+			`{"message":"password must be at least 3 characters long"}`,
+		))
+		return
+	}
+
+	// validate user
+
+	// hash password
+
+	// create user
+
+	// generate token?
+
+	w.WriteHeader(http.StatusCreated)
 }
 
 func (h handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 
-	if r.Header.Get("Content-Type") != "application/json"{
-		w.WriteHeader(http.StatusBadRequest)
-		w.Write([]byte(`{"message":"wrong content type"}`))
-		return
+	m := r.Method
+	if m == http.MethodPost || m == http.MethodPut ||
+			m == http.MethodDelete || m == http.MethodPatch {
+		if r.Header.Get("Content-Type") != "application/json" {
+			w.WriteHeader(http.StatusBadRequest)
+			w.Write([]byte(`{"message":"wrong content type"}`))
+			return
+		}
 	}
 
 	switch r.URL.String() {
