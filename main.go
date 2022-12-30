@@ -9,6 +9,7 @@ import (
 	"time"
 	"log"
 	"strings"
+	_"encoding/json"
 )
 
 type handler struct {
@@ -51,10 +52,43 @@ func loadenv() {
 	}
 }
 
+func allowMethods(w http.ResponseWriter, r *http.Request,
+		methods ...string) bool {
+	allowed := false
+	for _, m := range methods {
+		if r.Method == m {
+			allowed = true
+			break
+		}
+	}
+	if !allowed {
+		w.Header().Set("Allow", strings.Join(methods, ", "))
+		w.WriteHeader(http.StatusMethodNotAllowed)
+	}
+	return allowed
+}
+
+func register(h handler, w http.ResponseWriter, r *http.Request) {
+}
+
 func (h handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
-	w.WriteHeader(http.StatusOK)
-	w.Write([]byte(r.URL.String()))
+	w.Header().Set("Content-Type", "application/json")
+
+	if r.Header.Get("Content-Type") != "application/json"{
+		w.WriteHeader(http.StatusBadRequest)
+		w.Write([]byte(`{"message":"wrong content type"}`))
+		return
+	}
+
+	switch r.URL.String() {
+	case "/register":
+		if allowMethods(w, r, http.MethodPost) {
+			register(h, w, r)
+		}
+	default:
+		w.WriteHeader(http.StatusNotFound)
+		w.Write([]byte(`{"message":"api route does not exist"}`))
+	}
 }
 
 func connectDatabase() *sql.DB {
