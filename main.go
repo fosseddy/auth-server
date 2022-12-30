@@ -4,89 +4,84 @@ import (
 	"fmt"
 	"net/http"
 	"os"
-	"io"
-	"encoding/json"
 	"database/sql"
-	_ "github.com/go-sql-driver/mysql"
+	_"github.com/go-sql-driver/mysql"
 	"time"
+	"log"
+	"strings"
 )
 
-const addr string = ":3000"
+type handler struct {
+	db *sql.DB
+}
 
-type handler struct {}
+func loadenv() {
+	data, err := os.ReadFile(".env")
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	lines := strings.Split(string(data), "\n")
+	tmp := []string{}
+	for _, ln := range(lines) {
+		ln = strings.Trim(ln, " ")
+		if ln == "" {
+			continue
+		}
+		tmp = append(tmp, ln)
+	}
+
+	lines = tmp
+	if len(lines) == 0 {
+		log.Fatal(".env is empty")
+	}
+	for _, ln := range(lines) {
+		k, v, found := strings.Cut(ln, "=")
+		if !found {
+			log.Fatal("wrong line in .env file: ", ln)
+		}
+
+		k = strings.Trim(k, " ")
+		v = strings.Trim(v, " ")
+
+		err := os.Setenv(k, v)
+		if err != nil {
+			log.Fatal(err)
+		}
+	}
+}
 
 func (h handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	uri := r.URL.String()
-	method := r.Method
-
-	if r.Header.Get("Content-Type") != "application/json" {
-		w.WriteHeader(http.StatusBadRequest)
-		return
-	}
-
-	if uri != "/register" && method != http.MethodPost {
-		w.WriteHeader(http.StatusNotImplemented)
-		return
-	}
-
-	rbody, _ := io.ReadAll(r.Body)
-	rbodyjson := map[string]any{}
-	json.Unmarshal(rbody, &rbodyjson) // handle error
-
-	wbody := map[string]any{
-		"data": map[string]string{
-			"token": "sadf7as0d9f7a90s7df",
-		},
-	}
-	wbodyjson, _ := json.Marshal(wbody) // handle error
-
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(http.StatusCreated)
-	w.Write(wbodyjson)
+	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+	w.WriteHeader(http.StatusOK)
+	w.Write([]byte(r.URL.String()))
 }
 
-type user struct {
-	id int
-	username string
-	password string
-}
+func connectDatabase() *sql.DB {
+	connStr := fmt.Sprintf(
+		"%s:%s@/%s",
+		os.Getenv("DB_USER"),
+		os.Getenv("DB_USERPWD"),
+		os.Getenv("DB_NAME"),
+	)
 
-func main() {
-	db, err := sql.Open("mysql", "art:123@/auth-server")
+	db, err := sql.Open("mysql", connStr)
 	if err != nil {
-		panic(err)
+		log.Fatal(err)
 	}
+
 	db.SetConnMaxLifetime(time.Minute * 3)
 	db.SetMaxOpenConns(10)
 	db.SetMaxIdleConns(10)
 
-	rows, err := db.Query("select * from user")
-	if err != nil {
-		panic(err)
-	}
-	defer rows.Close()
+	return db
+}
 
-	users := []user{}
-	for rows.Next() {
-		u := user{}
-		err := rows.Scan(&u.id, &u.username, &u.password)
-		if err != nil {
-			panic(err)
-		}
-		users = append(users, u)
-	}
+func main() {
+	loadenv()
 
-	err = rows.Err()
-	if err != nil {
-		panic(err)
-	}
-
-	fmt.Printf("%+v\n", users)
-
-	h := handler{}
-	s := http.Server{Addr: addr, Handler: h}
-
-	fmt.Println("server is listening on", s.Addr)
-	err = s.ListenAndServe()
-	fmt.Fprintf(os.Stderr, "failed to start a server: %v\n", err)
+	h := handler{db: connectDatabase()}
+	s := http.Server{Addr: ":" + os.Getenv("PORT"), Handler: h}
+	err := s.ListenAndServe()
+	log.Fatal(err)
 }
