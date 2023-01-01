@@ -19,7 +19,7 @@ import (
 )
 
 // at least 3 chars long, starts with alpha then [a-zA-Z0-9_]
-var	usernameRegexp = regexp.MustCompile(`^[a-zA-Z]{1}\w{2,}$`)
+var usernameRegexp = regexp.MustCompile(`^[a-zA-Z]{1}\w{2,}$`)
 
 type handler struct {
 	db *sql.DB
