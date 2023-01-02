@@ -2,25 +2,27 @@ package main
 
 import (
 	_"github.com/go-sql-driver/mysql"
-	"database/sql"
 	"github.com/golang-jwt/jwt/v4"
 	"fmt"
-	"net/http"
 	"os"
 	"io"
 	"time"
 	"log"
 	"strings"
+	"regexp"
+	"errors"
+	"net/http"
+	"database/sql"
 	"encoding/json"
 	"encoding/base64"
-	"regexp"
 	"crypto/rand"
 	"crypto/sha256"
-	"errors"
 )
 
-// at least 3 chars long, starts with alpha then [a-zA-Z0-9_]
+// at least 3 chars long; starts with alpha then word
 var usernameRegexp = regexp.MustCompile(`^[a-zA-Z]{1}\w{2,}$`)
+// 2 parts separated by +; first is word(includes -) at least 2 chars long; second is word at least 3 chars long
+var appdeviceRegexp = regexp.MustCompile(`^[\w-]{2,}\+\w{3,}$`)
 
 type handler struct {
 	db *sql.DB
@@ -35,22 +37,20 @@ func expectMethod(m string, w http.ResponseWriter, r *http.Request) bool {
 	return match
 }
 
-func writeData(w http.ResponseWriter, status int, data any) {
-	w.WriteHeader(status)
-	if data == nil {
-		return
+func validateCredentials(username, password string) error {
+	if !usernameRegexp.MatchString(username) {
+		return errors.New("username must start with a letter and be at least 3 characters long")
 	}
-	m := map[string]any{"data": data}
-	b, err := json.Marshal(m)
-	if err != nil {
-		writeServerErr(w, err)
-		return
+	if len(password) < 3 {
+		return errors.New("password must be at least 3 characters long")
 	}
-	w.Write(b)
+	return nil
 }
 
 func writeServerErr(w http.ResponseWriter, err error) {
+	log.Println(err.Error())
 	log.Printf("%#v\n", err)
+	log.Println("-------------------------")
 	w.WriteHeader(http.StatusInternalServerError)
 }
 
@@ -62,6 +62,20 @@ func writeErr(w http.ResponseWriter, status int, msg string) {
 		return
 	}
 	w.WriteHeader(status)
+	w.Write(b)
+}
+
+func writeData(w http.ResponseWriter, status int, data any) {
+	w.WriteHeader(status)
+	if data == nil {
+		return
+	}
+	m := map[string]any{"data": data}
+	b, err := json.Marshal(m)
+	if err != nil {
+		writeServerErr(w, err)
+		return
+	}
 	w.Write(b)
 }
 
@@ -87,8 +101,40 @@ func createSalt() (string, error) {
 	return base64.URLEncoding.EncodeToString(b), nil
 }
 
-func createHash(pwd, salt string) string {
-	return fmt.Sprintf("%x", sha256.Sum256([]byte(pwd + salt)))
+func createHash(password, salt string) string {
+	return fmt.Sprintf("%x", sha256.Sum256([]byte(password + salt)))
+}
+
+func hashPassword(password string) (string, string, error) {
+	salt, err := createSalt()
+	if err != nil {
+		return "", "", err
+	}
+	hash := createHash(password, salt)
+	return hash, salt, nil
+}
+
+func createTokenPair(userId int64, appdevice string) (string, string, error) {
+	accessTok := jwt.NewWithClaims(jwt.SigningMethodHS256, jwt.MapClaims{
+		"exp": time.Now().Add(time.Minute * 15).Unix(),
+		"user": userId,
+	})
+	access, err := accessTok.SignedString([]byte(os.Getenv("JWT_ACC_SECRET")))
+	if err != nil {
+		return "", "", err
+	}
+
+	refreshTok := jwt.NewWithClaims(jwt.SigningMethodHS256, jwt.MapClaims{
+		"exp": time.Now().Add(time.Hour * 24).Unix(),
+		"user": userId,
+		"appdevice": appdevice,
+	})
+	refresh, err := refreshTok.SignedString([]byte(os.Getenv("JWT_REF_SECRET")))
+	if err != nil {
+		return "", "", err
+	}
+
+	return access, refresh, nil
 }
 
 func register(h handler, w http.ResponseWriter, r *http.Request) {
@@ -105,41 +151,35 @@ func register(h handler, w http.ResponseWriter, r *http.Request) {
 	body.Username = strings.TrimSpace(body.Username)
 	body.Password = strings.TrimSpace(body.Password)
 
-	if !usernameRegexp.MatchString(body.Username) {
-		writeErr(w, http.StatusBadRequest, "username must start with a letter and be at least 3 characters long")
-		return
-	}
-	if len(body.Password) < 3 {
-		writeErr(w, http.StatusBadRequest, "password must be at least 3 characters long")
+	err = validateCredentials(body.Username, body.Password)
+	if err != nil {
+		writeErr(w, http.StatusBadRequest, err.Error())
 		return
 	}
 
 	row := h.db.QueryRow("SELECT id FROM user WHERE username = ?", body.Username)
-	err = row.Err()
-	if err != nil {
+	userId := -1
+	err = row.Scan(&userId)
+	if err != nil && err != sql.ErrNoRows {
 		writeServerErr(w, err)
 		return
 	}
-	err = row.Scan()
-	if err != sql.ErrNoRows {
+	if userId != -1 {
 		writeErr(w, http.StatusBadRequest, "user already exists")
 		return
 	}
 
-	salt, err := createSalt()
+	hash, salt, err := hashPassword(body.Password)
 	if err != nil {
 		writeServerErr(w, err)
 		return
 	}
-	hash := createHash(body.Password, salt)
 
 	_, err = h.db.Exec("INSERT INTO user (username, salt, password) VALUES (?, ?, ?)", body.Username, salt, hash)
 	if err != nil {
 		writeServerErr(w, err)
 		return
 	}
-
-	// @Todo(art): login user?
 
 	writeData(w, http.StatusCreated, nil)
 }
@@ -148,6 +188,7 @@ func login(h handler, w http.ResponseWriter, r *http.Request) {
 	body := struct {
 		Username string `json:"username"`
 		Password string `json:"password"`
+		AppDevice string `json:"appdevice"`
 	}{}
 	err := readBody(r.Body, &body)
 	if err != nil {
@@ -157,29 +198,27 @@ func login(h handler, w http.ResponseWriter, r *http.Request) {
 
 	body.Username = strings.TrimSpace(body.Username)
 	body.Password = strings.TrimSpace(body.Password)
+	body.AppDevice = strings.TrimSpace(body.AppDevice)
 
-	if !usernameRegexp.MatchString(body.Username) {
-		writeErr(w, http.StatusBadRequest, "username must start with a letter and be at least 3 characters long")
+	err = validateCredentials(body.Username, body.Password)
+	if err != nil {
+		writeErr(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	if len(body.Password) < 3 {
-		writeErr(w, http.StatusBadRequest, "password must be at least 3 characters long")
+	if !appdeviceRegexp.MatchString(body.AppDevice) {
+		writeErr(w, http.StatusBadRequest, "app: at least 2 chars long; device: at least 3 chars long; separated by +")
 		return
 	}
 
 	row := h.db.QueryRow("SELECT * FROM user WHERE username = ?", body.Username)
-	err = row.Err()
-	if err != nil {
-		writeServerErr(w, err)
-		return
-	}
 	user := struct {
-		ID int
-		Username string
-		Salt string
-		Password string
+		id int64
+		username string
+		salt string
+		password string
 	}{}
-	err = row.Scan(&user.ID, &user.Username, &user.Salt, &user.Password)
+
+	err = row.Scan(&user.id, &user.username, &user.salt, &user.password)
 	if err != nil {
 		if err == sql.ErrNoRows {
 			writeErr(w, http.StatusBadRequest, "user does not exists")
@@ -189,37 +228,98 @@ func login(h handler, w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	hash := createHash(body.Password, user.Salt)
-	if hash != user.Password {
+	hash := createHash(body.Password, user.salt)
+	if hash != user.password {
 		writeErr(w, http.StatusBadRequest, "wrong password")
 		return
 	}
 
-	accessTok := jwt.NewWithClaims(jwt.SigningMethodHS256, jwt.MapClaims{
-		"exp": time.Now().Add(time.Minute * 15).Unix(),
-		"user": user.ID,
-	})
-	access, err := accessTok.SignedString([]byte(os.Getenv("JWT_ACC_SECRET")))
+	access, refresh, err := createTokenPair(user.id, body.AppDevice)
 	if err != nil {
 		writeServerErr(w, err)
 		return
 	}
 
-	refreshTok := jwt.NewWithClaims(jwt.SigningMethodHS256, jwt.MapClaims{
-		"exp": time.Now().Add(time.Hour * 24).Unix(),
-		"user": user.ID,
-	})
-	refresh, err := refreshTok.SignedString([]byte(os.Getenv("JWT_REF_SECRET")))
+	_, err = h.db.Exec(
+		"INSERT INTO token (user_id, appdevice, value) VALUES (?, ?, ?) ON DUPLICATE KEY UPDATE value = ?",
+		user.id, body.AppDevice, refresh, refresh,
+	)
 	if err != nil {
 		writeServerErr(w, err)
 		return
 	}
 
-	writeData(w, http.StatusCreated, map[string]string{"access": access, "refresh": refresh})
+	writeData(w, http.StatusOK, map[string]string{"access": access, "refresh": refresh})
+}
+
+func refresh(h handler, w http.ResponseWriter, r *http.Request) {
+	body := struct {Refresh string `json:"refresh"`}{}
+	err := readBody(r.Body, &body)
+	if err != nil {
+		writeErr(w, http.StatusBadRequest, err.Error())
+		return
+	}
+
+	body.Refresh = strings.TrimSpace(body.Refresh)
+	if body.Refresh == "" {
+		writeErr(w, http.StatusBadRequest, "refresh token is required")
+		return
+	}
+
+	claims := struct {
+		User int64 `json:"user"`
+		Appdevice string `json:"appdevice"`
+		jwt.RegisteredClaims
+	}{}
+	_, err = jwt.ParseWithClaims(body.Refresh, &claims, func (t *jwt.Token) (any, error) {
+		 _, ok := t.Method.(*jwt.SigningMethodHMAC)
+		 if !ok {
+			 return nil, fmt.Errorf("unexpected signing method %v\n", t.Header["alg"])
+		 }
+		 return []byte(os.Getenv("JWT_REF_SECRET")), nil
+	})
+
+	if err != nil {
+		writeErr(w, http.StatusBadRequest, err.Error())
+		return
+	}
+
+	row := h.db.QueryRow("SELECT id FROM token WHERE user_id = ?", claims.User)
+	tokId := -1
+	err = row.Scan(&tokId)
+	if err != nil && err != sql.ErrNoRows {
+		writeServerErr(w, err)
+		return
+	}
+	if tokId == -1 {
+		writeErr(w, http.StatusBadRequest, "invalid token")
+		return
+	}
+
+	access, refresh, err := createTokenPair(claims.User, claims.Appdevice)
+	if err != nil {
+		writeServerErr(w, err)
+		return
+	}
+
+	_, err = h.db.Exec("UPDATE token SET value = ? WHERE id = ?", refresh, tokId)
+	if err != nil {
+		writeServerErr(w, err)
+		return
+	}
+
+	writeData(w, http.StatusOK, map[string]string{"access": access, "refresh": refresh})
 }
 
 func (h handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
+
+	if r.Method == http.MethodPost {
+		if r.Header.Get("Content-Type") != "application/json" {
+			writeErr(w, http.StatusBadRequest, "wrong content type")
+			return
+		}
+	}
 
 	switch r.URL.String() {
 	case "/register":
@@ -230,9 +330,12 @@ func (h handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		if expectMethod(http.MethodPost, w, r) {
 			login(h, w, r)
 		}
+	case "/refresh":
+		if expectMethod(http.MethodPost, w, r) {
+			refresh(h, w, r)
+		}
 	default:
-		w.WriteHeader(http.StatusNotFound)
-		w.Write([]byte(`{"message":"api route does not exist"}`))
+		writeErr(w, http.StatusNotFound, "api route does not exist")
 	}
 }
 
