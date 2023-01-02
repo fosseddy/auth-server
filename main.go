@@ -221,7 +221,7 @@ func login(h handler, w http.ResponseWriter, r *http.Request) {
 	err = row.Scan(&user.id, &user.username, &user.salt, &user.password)
 	if err != nil {
 		if err == sql.ErrNoRows {
-			writeErr(w, http.StatusBadRequest, "user does not exists")
+			writeErr(w, http.StatusBadRequest, "user does not exist")
 			return
 		}
 		writeServerErr(w, err)
@@ -346,7 +346,7 @@ func loadenv() {
 	}
 
 	lines := strings.Split(string(data), "\n")
-	for _, ln := range(lines) {
+	for _, ln := range lines {
 		ln = strings.TrimSpace(ln)
 		if ln == "" {
 			continue
