@@ -3,6 +3,7 @@ package main
 import (
 	_"github.com/go-sql-driver/mysql"
 	"database/sql"
+	"github.com/golang-jwt/jwt/v4"
 	"fmt"
 	"net/http"
 	"os"
@@ -77,6 +78,19 @@ func readBody(body io.Reader, target any) error {
 	return nil
 }
 
+func createSalt() (string, error) {
+	b := make([]byte, 32)
+	_, err := rand.Read(b)
+	if err != nil {
+		return "", err
+	}
+	return base64.URLEncoding.EncodeToString(b), nil
+}
+
+func createHash(pwd, salt string) string {
+	return fmt.Sprintf("%x", sha256.Sum256([]byte(pwd + salt)))
+}
+
 func register(h handler, w http.ResponseWriter, r *http.Request) {
 	body := struct {
 		Username string `json:"username"`
@@ -108,20 +122,18 @@ func register(h handler, w http.ResponseWriter, r *http.Request) {
 	}
 	err = row.Scan()
 	if err != sql.ErrNoRows {
-		writeErr(w, http.StatusBadRequest, "username already exists")
+		writeErr(w, http.StatusBadRequest, "user already exists")
 		return
 	}
 
-	saltBytes := make([]byte, 32)
-	_, err = rand.Read(saltBytes)
+	salt, err := createSalt()
 	if err != nil {
 		writeServerErr(w, err)
 		return
 	}
-	salt := base64.URLEncoding.EncodeToString(saltBytes)
-	password := fmt.Sprintf("%x", sha256.Sum256([]byte(body.Password + salt)))
+	hash := createHash(body.Password, salt)
 
-	_, err = h.db.Exec("INSERT INTO user (username, salt, password) VALUES (?, ?, ?)", body.Username, salt, password)
+	_, err = h.db.Exec("INSERT INTO user (username, salt, password) VALUES (?, ?, ?)", body.Username, salt, hash)
 	if err != nil {
 		writeServerErr(w, err)
 		return
@@ -132,20 +144,91 @@ func register(h handler, w http.ResponseWriter, r *http.Request) {
 	writeData(w, http.StatusCreated, nil)
 }
 
+func login(h handler, w http.ResponseWriter, r *http.Request) {
+	body := struct {
+		Username string `json:"username"`
+		Password string `json:"password"`
+	}{}
+	err := readBody(r.Body, &body)
+	if err != nil {
+		writeErr(w, http.StatusBadRequest, err.Error())
+		return
+	}
+
+	body.Username = strings.TrimSpace(body.Username)
+	body.Password = strings.TrimSpace(body.Password)
+
+	if !usernameRegexp.MatchString(body.Username) {
+		writeErr(w, http.StatusBadRequest, "username must start with a letter and be at least 3 characters long")
+		return
+	}
+	if len(body.Password) < 3 {
+		writeErr(w, http.StatusBadRequest, "password must be at least 3 characters long")
+		return
+	}
+
+	row := h.db.QueryRow("SELECT * FROM user WHERE username = ?", body.Username)
+	err = row.Err()
+	if err != nil {
+		writeServerErr(w, err)
+		return
+	}
+	user := struct {
+		ID int
+		Username string
+		Salt string
+		Password string
+	}{}
+	err = row.Scan(&user.ID, &user.Username, &user.Salt, &user.Password)
+	if err != nil {
+		if err == sql.ErrNoRows {
+			writeErr(w, http.StatusBadRequest, "user does not exists")
+			return
+		}
+		writeServerErr(w, err)
+		return
+	}
+
+	hash := createHash(body.Password, user.Salt)
+	if hash != user.Password {
+		writeErr(w, http.StatusBadRequest, "wrong password")
+		return
+	}
+
+	accessTok := jwt.NewWithClaims(jwt.SigningMethodHS256, jwt.MapClaims{
+		"exp": time.Now().Add(time.Minute * 15).Unix(),
+		"user": user.ID,
+	})
+	access, err := accessTok.SignedString([]byte(os.Getenv("JWT_ACC_SECRET")))
+	if err != nil {
+		writeServerErr(w, err)
+		return
+	}
+
+	refreshTok := jwt.NewWithClaims(jwt.SigningMethodHS256, jwt.MapClaims{
+		"exp": time.Now().Add(time.Hour * 24).Unix(),
+		"user": user.ID,
+	})
+	refresh, err := refreshTok.SignedString([]byte(os.Getenv("JWT_REF_SECRET")))
+	if err != nil {
+		writeServerErr(w, err)
+		return
+	}
+
+	writeData(w, http.StatusCreated, map[string]string{"access": access, "refresh": refresh})
+}
+
 func (h handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
-
-	// @Todo(art): handle it later
-	//if r.Header.Get("Content-Type") != "application/json" {
-	//	w.WriteHeader(http.StatusBadRequest)
-	//	w.Write([]byte(`{"message":"wrong content type"}`))
-	//	return
-	//}
 
 	switch r.URL.String() {
 	case "/register":
 		if expectMethod(http.MethodPost, w, r) {
 			register(h, w, r)
+		}
+	case "/login":
+		if expectMethod(http.MethodPost, w, r) {
+			login(h, w, r)
 		}
 	default:
 		w.WriteHeader(http.StatusNotFound)
