@@ -19,14 +19,14 @@ import (
 	"crypto/sha256"
 )
 
+type handler struct {
+	db *sql.DB
+}
+
 // at least 3 chars long; starts with alpha then word
 var usernameRegexp = regexp.MustCompile(`^[a-zA-Z]{1}\w{2,}$`)
 // 2 parts separated by +; first is word(includes -) at least 2 chars long; second is word at least 3 chars long
 var appdeviceRegexp = regexp.MustCompile(`^[\w-]{2,}\+\w{3,}$`)
-
-type handler struct {
-	db *sql.DB
-}
 
 func expectMethod(m string, w http.ResponseWriter, r *http.Request) bool {
 	match := r.Method == m
@@ -114,27 +114,12 @@ func hashPassword(password string) (string, string, error) {
 	return hash, salt, nil
 }
 
-func createTokenPair(userId int64, appdevice string) (string, string, error) {
-	accessTok := jwt.NewWithClaims(jwt.SigningMethodHS256, jwt.MapClaims{
-		"exp": time.Now().Add(time.Minute * 15).Unix(),
+func createToken(userId int64) (string, error) {
+	tok := jwt.NewWithClaims(jwt.SigningMethodHS256, jwt.MapClaims{
+		"exp": time.Now().Add(time.Hour * 26).Unix(),
 		"user": userId,
 	})
-	access, err := accessTok.SignedString([]byte(os.Getenv("JWT_ACC_SECRET")))
-	if err != nil {
-		return "", "", err
-	}
-
-	refreshTok := jwt.NewWithClaims(jwt.SigningMethodHS256, jwt.MapClaims{
-		"exp": time.Now().Add(time.Hour * 24).Unix(),
-		"user": userId,
-		"appdevice": appdevice,
-	})
-	refresh, err := refreshTok.SignedString([]byte(os.Getenv("JWT_REF_SECRET")))
-	if err != nil {
-		return "", "", err
-	}
-
-	return access, refresh, nil
+	return tok.SignedString([]byte(os.Getenv("JWT_SECRET")))
 }
 
 func register(h handler, w http.ResponseWriter, r *http.Request) {
@@ -188,7 +173,6 @@ func login(h handler, w http.ResponseWriter, r *http.Request) {
 	body := struct {
 		Username string `json:"username"`
 		Password string `json:"password"`
-		AppDevice string `json:"appdevice"`
 	}{}
 	err := readBody(r.Body, &body)
 	if err != nil {
@@ -198,15 +182,10 @@ func login(h handler, w http.ResponseWriter, r *http.Request) {
 
 	body.Username = strings.TrimSpace(body.Username)
 	body.Password = strings.TrimSpace(body.Password)
-	body.AppDevice = strings.TrimSpace(body.AppDevice)
 
 	err = validateCredentials(body.Username, body.Password)
 	if err != nil {
 		writeErr(w, http.StatusBadRequest, err.Error())
-		return
-	}
-	if !appdeviceRegexp.MatchString(body.AppDevice) {
-		writeErr(w, http.StatusBadRequest, "app: at least 2 chars long; device: at least 3 chars long; separated by +")
 		return
 	}
 
@@ -234,81 +213,61 @@ func login(h handler, w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	access, refresh, err := createTokenPair(user.id, body.AppDevice)
+	tok, err := createToken(user.id)
 	if err != nil {
 		writeServerErr(w, err)
 		return
 	}
 
-	_, err = h.db.Exec(
-		"INSERT INTO token (user_id, appdevice, value) VALUES (?, ?, ?) ON DUPLICATE KEY UPDATE value = ?",
-		user.id, body.AppDevice, refresh, refresh,
-	)
-	if err != nil {
-		writeServerErr(w, err)
-		return
-	}
-
-	writeData(w, http.StatusOK, map[string]string{"access": access, "refresh": refresh})
+	writeData(w, http.StatusOK, tok)
 }
 
-func refresh(h handler, w http.ResponseWriter, r *http.Request) {
-	body := struct {Refresh string `json:"refresh"`}{}
-	err := readBody(r.Body, &body)
-	if err != nil {
-		writeErr(w, http.StatusBadRequest, err.Error())
+func checkToken(h handler, w http.ResponseWriter, r *http.Request) {
+	auth := r.Header.Get("Authorization")
+	if auth == "" {
+		writeErr(w, http.StatusBadRequest, "no authorization header")
 		return
 	}
 
-	body.Refresh = strings.TrimSpace(body.Refresh)
-	if body.Refresh == "" {
-		writeErr(w, http.StatusBadRequest, "refresh token is required")
+	scheme, token, found := strings.Cut(auth, " ")
+	if !found {
+		writeErr(w, http.StatusBadRequest, "wrong authorization header value")
+		return
+	}
+	if scheme != "Bearer" {
+		writeErr(w, http.StatusBadRequest, "wrong authentication scheme")
 		return
 	}
 
 	claims := struct {
 		User int64 `json:"user"`
-		Appdevice string `json:"appdevice"`
 		jwt.RegisteredClaims
 	}{}
-	_, err = jwt.ParseWithClaims(body.Refresh, &claims, func (t *jwt.Token) (any, error) {
+	_, err := jwt.ParseWithClaims(token, &claims, func (t *jwt.Token) (any, error) {
 		 _, ok := t.Method.(*jwt.SigningMethodHMAC)
 		 if !ok {
 			 return nil, fmt.Errorf("unexpected signing method %v\n", t.Header["alg"])
 		 }
-		 return []byte(os.Getenv("JWT_REF_SECRET")), nil
+		 return []byte(os.Getenv("JWT_SECRET")), nil
 	})
-
 	if err != nil {
 		writeErr(w, http.StatusBadRequest, err.Error())
 		return
 	}
 
-	row := h.db.QueryRow("SELECT id FROM token WHERE user_id = ?", claims.User)
-	tokId := -1
-	err = row.Scan(&tokId)
-	if err != nil && err != sql.ErrNoRows {
-		writeServerErr(w, err)
-		return
-	}
-	if tokId == -1 {
-		writeErr(w, http.StatusBadRequest, "invalid token")
-		return
-	}
-
-	access, refresh, err := createTokenPair(claims.User, claims.Appdevice)
+	row := h.db.QueryRow("SELECT id FROM user WHERE id = ?", claims.User)
+	userId := -1
+	err = row.Scan(&userId)
 	if err != nil {
+		if err == sql.ErrNoRows {
+			writeErr(w, http.StatusBadRequest, "user does not exist")
+			return
+		}
 		writeServerErr(w, err)
 		return
 	}
 
-	_, err = h.db.Exec("UPDATE token SET value = ? WHERE id = ?", refresh, tokId)
-	if err != nil {
-		writeServerErr(w, err)
-		return
-	}
-
-	writeData(w, http.StatusOK, map[string]string{"access": access, "refresh": refresh})
+	writeData(w, http.StatusOK, nil)
 }
 
 func (h handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -330,9 +289,9 @@ func (h handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		if expectMethod(http.MethodPost, w, r) {
 			login(h, w, r)
 		}
-	case "/refresh":
-		if expectMethod(http.MethodPost, w, r) {
-			refresh(h, w, r)
+	case "/check-token":
+		if expectMethod(http.MethodGet, w, r) {
+			checkToken(h, w, r)
 		}
 	default:
 		writeErr(w, http.StatusNotFound, "api route does not exist")
