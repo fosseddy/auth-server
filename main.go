@@ -9,6 +9,7 @@ import (
 	"time"
 	"log"
 	"strings"
+	"strconv"
 	"regexp"
 	"errors"
 	"net/http"
@@ -65,13 +66,6 @@ func validateCredentials(username, password string) error {
 	return nil
 }
 
-func writeServerErr(w http.ResponseWriter, err error) {
-	log.Println(err.Error())
-	log.Printf("%#v\n", err)
-	log.Println("-------------------------")
-	w.WriteHeader(http.StatusInternalServerError)
-}
-
 func writeErr(w http.ResponseWriter, status int, msg string) {
 	m := map[string]any{"error": map[string]any{"code": status, "message": msg}}
 	b, err := json.Marshal(m)
@@ -81,6 +75,13 @@ func writeErr(w http.ResponseWriter, status int, msg string) {
 	}
 	w.WriteHeader(status)
 	w.Write(b)
+}
+
+func writeServerErr(w http.ResponseWriter, err error) {
+	log.Println(err.Error())
+	log.Printf("%#v\n", err)
+	log.Println("-------------------------")
+	writeErr(w, http.StatusInternalServerError, "server error")
 }
 
 func writeData(w http.ResponseWriter, status int, data any) {
@@ -269,14 +270,40 @@ func checkToken(h handler, w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if u == nil {
-		writeErr(w, http.StatusBadRequest, "user does not exist")
+		writeErr(w, http.StatusBadRequest, "token attached to unknown user id")
 		return
 	}
 
-	writeData(w, http.StatusOK, u.id)
+	writeData(w, http.StatusOK, map[string]any{"user_id": u.id})
 }
 
 func profile(h handler, w http.ResponseWriter, r *http.Request) {
+	key, value, found := strings.Cut(r.URL.RawQuery, "=")
+	if !found {
+		writeErr(w, http.StatusBadRequest, "wrong query value")
+		return
+	}
+	if key != "id" {
+		writeErr(w, http.StatusBadRequest, "id is required")
+		return
+	}
+	id, err := strconv.ParseInt(value, 10, 64)
+	if err != nil {
+		writeErr(w, http.StatusBadRequest, "id is not a number")
+		return
+	}
+
+	u, err := queryUserBy("id", id, h.db)
+	if err != nil {
+		writeServerErr(w, err)
+		return
+	}
+	if u == nil {
+		writeErr(w, http.StatusNotFound, "user does not exist")
+		return
+	}
+
+	writeData(w, http.StatusOK, map[string]any{"id": u.id, "username": u.username})
 }
 
 func (h handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -289,7 +316,7 @@ func (h handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	switch r.URL.String() {
+	switch r.URL.Path {
 	case "/register":
 		if expectMethod(http.MethodPost, w, r) {
 			register(h, w, r)
@@ -303,8 +330,8 @@ func (h handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			checkToken(h, w, r)
 		}
 	case "/profile":
-		if expectMethod(http.MethodPost, w, r) {
-			checkToken(h, w, r)
+		if expectMethod(http.MethodGet, w, r) {
+			profile(h, w, r)
 		}
 	default:
 		writeErr(w, http.StatusNotFound, "api route does not exist")
