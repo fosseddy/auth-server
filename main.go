@@ -23,10 +23,28 @@ type handler struct {
 	db *sql.DB
 }
 
+type user struct {
+	id int64
+	username string
+	salt string
+	password string
+}
+
 // at least 3 chars long; starts with alpha then word
 var usernameRegexp = regexp.MustCompile(`^[a-zA-Z]{1}\w{2,}$`)
-// 2 parts separated by +; first is word(includes -) at least 2 chars long; second is word at least 3 chars long
-var appdeviceRegexp = regexp.MustCompile(`^[\w-]{2,}\+\w{3,}$`)
+
+func queryUserBy(field string, value any, db *sql.DB) (*user, error) {
+	u := new(user)
+	row := db.QueryRow("SELECT * FROM user WHERE " + field + " = ?", value)
+	err := row.Scan(&u.id, &u.username, &u.salt, &u.password)
+	if err != nil {
+		if err == sql.ErrNoRows {
+			return nil, nil
+		}
+		return nil, err
+	}
+	return u, nil
+}
 
 func expectMethod(m string, w http.ResponseWriter, r *http.Request) bool {
 	match := r.Method == m
@@ -142,14 +160,12 @@ func register(h handler, w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	row := h.db.QueryRow("SELECT id FROM user WHERE username = ?", body.Username)
-	userId := -1
-	err = row.Scan(&userId)
-	if err != nil && err != sql.ErrNoRows {
+	u, err := queryUserBy("username", body.Username, h.db)
+	if err != nil {
 		writeServerErr(w, err)
 		return
 	}
-	if userId != -1 {
+	if u != nil {
 		writeErr(w, http.StatusBadRequest, "user already exists")
 		return
 	}
@@ -189,53 +205,45 @@ func login(h handler, w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	row := h.db.QueryRow("SELECT * FROM user WHERE username = ?", body.Username)
-	user := struct {
-		id int64
-		username string
-		salt string
-		password string
-	}{}
-
-	err = row.Scan(&user.id, &user.username, &user.salt, &user.password)
+	u, err := queryUserBy("username", body.Username, h.db)
 	if err != nil {
-		if err == sql.ErrNoRows {
-			writeErr(w, http.StatusBadRequest, "user does not exist")
-			return
-		}
 		writeServerErr(w, err)
 		return
 	}
+	if u == nil {
+		writeErr(w, http.StatusBadRequest, "user does not exist")
+		return
+	}
 
-	hash := createHash(body.Password, user.salt)
-	if hash != user.password {
+	hash := createHash(body.Password, u.salt)
+	if hash != u.password {
 		writeErr(w, http.StatusBadRequest, "wrong password")
 		return
 	}
 
-	tok, err := createToken(user.id)
+	tok, err := createToken(u.id)
 	if err != nil {
 		writeServerErr(w, err)
 		return
 	}
 
-	writeData(w, http.StatusOK, tok)
+	writeData(w, http.StatusOK, map[string]any{
+		"token": tok,
+		"user": map[string]any{"id": u.id, "username": u.username},
+	})
 }
 
 func checkToken(h handler, w http.ResponseWriter, r *http.Request) {
-	auth := r.Header.Get("Authorization")
-	if auth == "" {
-		writeErr(w, http.StatusBadRequest, "no authorization header")
+	body := struct {Token string `json:"token"`}{}
+	err := readBody(r.Body, &body)
+	if err != nil {
+		writeErr(w, http.StatusBadRequest, err.Error())
 		return
 	}
 
-	scheme, token, found := strings.Cut(auth, " ")
-	if !found {
-		writeErr(w, http.StatusBadRequest, "wrong authorization header value")
-		return
-	}
-	if scheme != "Bearer" {
-		writeErr(w, http.StatusBadRequest, "wrong authentication scheme")
+	body.Token = strings.TrimSpace(body.Token)
+	if body.Token == "" {
+		writeErr(w, http.StatusBadRequest, "token is required")
 		return
 	}
 
@@ -243,7 +251,7 @@ func checkToken(h handler, w http.ResponseWriter, r *http.Request) {
 		User int64 `json:"user"`
 		jwt.RegisteredClaims
 	}{}
-	_, err := jwt.ParseWithClaims(token, &claims, func (t *jwt.Token) (any, error) {
+	_, err = jwt.ParseWithClaims(body.Token, &claims, func (t *jwt.Token) (any, error) {
 		 _, ok := t.Method.(*jwt.SigningMethodHMAC)
 		 if !ok {
 			 return nil, fmt.Errorf("unexpected signing method %v\n", t.Header["alg"])
@@ -255,19 +263,20 @@ func checkToken(h handler, w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	row := h.db.QueryRow("SELECT id FROM user WHERE id = ?", claims.User)
-	userId := -1
-	err = row.Scan(&userId)
+	u, err := queryUserBy("id", claims.User, h.db)
 	if err != nil {
-		if err == sql.ErrNoRows {
-			writeErr(w, http.StatusBadRequest, "user does not exist")
-			return
-		}
 		writeServerErr(w, err)
 		return
 	}
+	if u == nil {
+		writeErr(w, http.StatusBadRequest, "user does not exist")
+		return
+	}
 
-	writeData(w, http.StatusOK, nil)
+	writeData(w, http.StatusOK, u.id)
+}
+
+func profile(h handler, w http.ResponseWriter, r *http.Request) {
 }
 
 func (h handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -290,7 +299,11 @@ func (h handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			login(h, w, r)
 		}
 	case "/check-token":
-		if expectMethod(http.MethodGet, w, r) {
+		if expectMethod(http.MethodPost, w, r) {
+			checkToken(h, w, r)
+		}
+	case "/profile":
+		if expectMethod(http.MethodPost, w, r) {
 			checkToken(h, w, r)
 		}
 	default:
