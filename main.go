@@ -1,8 +1,10 @@
 package main
 
 import (
-	_"github.com/go-sql-driver/mysql"
+	_"github.com/mattn/go-sqlite3"
 	"github.com/golang-jwt/jwt/v4"
+
+	"database/sql"
 	"fmt"
 	"os"
 	"io"
@@ -13,7 +15,6 @@ import (
 	"regexp"
 	"errors"
 	"net/http"
-	"database/sql"
 	"encoding/json"
 	"encoding/base64"
 	"crypto/rand"
@@ -36,9 +37,9 @@ var usernameRegexp = regexp.MustCompile(`^[a-zA-Z]{1}\w{2,}$`)
 
 func queryUserBy(field string, value any, db *sql.DB) (*user, error) {
 	u := new(user)
+
 	row := db.QueryRow("SELECT * FROM user WHERE " + field + " = ?", value)
-	err := row.Scan(&u.id, &u.username, &u.salt, &u.password)
-	if err != nil {
+	if err := row.Scan(&u.id, &u.username, &u.salt, &u.password); err != nil {
 		if err == sql.ErrNoRows {
 			return nil, nil
 		}
@@ -135,7 +136,7 @@ func hashPassword(password string) (string, string, error) {
 
 func createToken(userId int64) (string, error) {
 	tok := jwt.NewWithClaims(jwt.SigningMethodHS256, jwt.MapClaims{
-		"exp": time.Now().Add(time.Hour * 26).Unix(),
+		"exp": time.Now().Add(time.Hour * 21).Unix(),
 		"user": userId,
 	})
 	return tok.SignedString([]byte(os.Getenv("JWT_SECRET")))
@@ -341,7 +342,7 @@ func (h handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 func loadenv() {
 	data, err := os.ReadFile(".env")
 	if err != nil {
-		log.Fatalf("%#v\n", err)
+		log.Fatal(err)
 	}
 
 	lines := strings.Split(string(data), "\n")
@@ -362,16 +363,15 @@ func loadenv() {
 
 		err := os.Setenv(k, v)
 		if err != nil {
-			log.Fatalf("%#v\n", err)
+			log.Fatal(err)
 		}
 	}
 }
 
 func connectDatabase() *sql.DB {
-	connStr := fmt.Sprintf("%s:%s@/%s", os.Getenv("DB_USER"), os.Getenv("DB_USERPWD"), os.Getenv("DB_NAME"))
-	db, err := sql.Open("mysql", connStr)
+	db, err := sql.Open("sqlite3", os.Getenv("DB_NAME"))
 	if err != nil {
-		log.Fatalf("%#v\n", err)
+		log.Fatal(err)
 	}
 
 	db.SetConnMaxLifetime(time.Minute * 3)
@@ -380,7 +380,7 @@ func connectDatabase() *sql.DB {
 
 	err = db.Ping()
 	if err != nil {
-		log.Fatalf("%#v\n", err)
+		log.Fatal(err)
 	}
 
 	return db
@@ -391,6 +391,7 @@ func main() {
 
 	h := handler{db: connectDatabase()}
 	s := http.Server{Addr: ":" + os.Getenv("PORT"), Handler: h}
-	err := s.ListenAndServe()
-	log.Fatalf("%#v\n", err)
+	if err := s.ListenAndServe(); err != nil {
+		log.Fatal(err)
+	}
 }
